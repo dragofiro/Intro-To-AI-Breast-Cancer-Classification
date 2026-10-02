@@ -1,4 +1,4 @@
-lazy import os
+import os
 import glob
 import pandas as pd
 import numpy as np
