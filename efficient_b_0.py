@@ -13,6 +13,7 @@ import re
 import glob
 import json
 import math
+import time
 
 import numpy as np
 import pandas as pd
@@ -123,10 +124,11 @@ def _load_and_resize(path):
 
 
 def build_or_load_cache(paths):
+    t0 = time.perf_counter()
     if os.path.exists(CACHE_PATH):
         arr = np.load(CACHE_PATH, mmap_mode="r")
         if arr.shape[0] == len(paths):
-            print(f"Loaded image cache: {CACHE_PATH} {arr.shape}")
+            print(f"Loaded image cache: {CACHE_PATH} {arr.shape} ({time.perf_counter() - t0:.2f}s)")
             return arr
         print("Cache size mismatch; rebuilding.")
 
@@ -137,7 +139,8 @@ def build_or_load_cache(paths):
           .prefetch(tf.data.AUTOTUNE))
     arr = np.concatenate(list(ds.as_numpy_iterator()), axis=0)
     np.save(CACHE_PATH, arr)
-    print(f"Saved cache: {CACHE_PATH} {arr.shape} ({arr.nbytes / 1e9:.2f} GB)")
+    print(f"Saved cache: {CACHE_PATH} {arr.shape} ({arr.nbytes / 1e9:.2f} GB) "
+          f"in {time.perf_counter() - t0:.2f}s")
     return np.load(CACHE_PATH, mmap_mode="r")
 
 
@@ -259,22 +262,36 @@ def early_stop():
 # ============================================================
 # 5. INFERENCE WITH TEST-TIME AUGMENTATION
 # ============================================================
+def _make_forward_fn(model):
+    @tf.function(reduce_retracing=True)
+    def forward(x):
+        out = model(x, training=False)
+        return (
+            tf.cast(out["malignant"], tf.float32),
+            tf.cast(out["subtype"], tf.float32),
+        )
+    return forward
+
+
 def predict_tta(model, idx, batch=64):
     """Average over 3 horizontal crops x (original + h-flip + v-flip) = 9 views."""
     offsets = sorted({0, CENTER_OFFSET, CACHE_W - CROP})
+    forward = _make_forward_fn(model)
     p_mal, p_sub = [], []
     for s in range(0, len(idx), batch):
-        chunk = np.asarray(IMAGES[np.sort(idx[s:s + batch])])
-        order = np.argsort(np.argsort(idx[s:s + batch]))   # restore requested order
+        sub_idx = idx[s:s + batch]
+        chunk = np.asarray(IMAGES[np.sort(sub_idx)])
+        order = np.argsort(np.argsort(sub_idx))   # restore requested order
         chunk = chunk[order].astype(np.float32)
-        pm, ps = 0.0, 0.0
+        pm = np.zeros((len(chunk), 1), dtype=np.float32)
+        ps = np.zeros((len(chunk), NUM_SUBTYPES), dtype=np.float32)
         n = 0
         for off in offsets:
             view = chunk[:, :CROP, off:off + CROP, :]
             for v in (view, view[:, :, ::-1], view[:, ::-1]):
-                out = model.predict(np.ascontiguousarray(v), verbose=0)
-                pm = pm + out["malignant"]
-                ps = ps + out["subtype"]
+                out_mal, out_sub = forward(tf.convert_to_tensor(np.ascontiguousarray(v), dtype=tf.float32))
+                pm += out_mal.numpy()
+                ps += out_sub.numpy()
                 n += 1
         p_mal.append((pm / n).ravel())
         p_sub.append(ps / n)
@@ -304,8 +321,13 @@ def sens_spec(y, p, thr):
 
 def threshold_for_sensitivity(y, p, target):
     fpr, tpr, thr = roc_curve(y, p)
-    i = int(np.argmax(tpr >= target))     # highest threshold that reaches the target
-    return float(thr[i])
+    valid = np.flatnonzero(tpr >= target)
+    if len(valid) == 0:
+        best_idx = int(np.argmax(tpr))
+        print(f"Warning: target sensitivity {target:.2f} unreachable; "
+              f"using max achievable sensitivity {tpr[best_idx]:.3f}.")
+        return float(thr[best_idx])
+    return float(thr[int(valid[-1])])
 
 
 # ============================================================
@@ -320,20 +342,29 @@ def run_fold(fold, train_idx, val_idx):
     model, base = build_model()
 
     # Phase 1: train the heads on a frozen backbone
+    t_p1 = time.perf_counter()
     compile_model(model, HEAD_LR)
     model.fit(train_ds, validation_data=val_ds, epochs=HEAD_EPOCHS,
               callbacks=[early_stop()], verbose=2)
+    p1_sec = time.perf_counter() - t_p1
 
     # Phase 2: unfreeze the top of the backbone, cosine LR decay
+    t_p2 = time.perf_counter()
     unfreeze_top(base, UNFREEZE_LAST_N)
     schedule = tf.keras.optimizers.schedules.CosineDecay(FT_LR, FT_EPOCHS * steps, alpha=0.05)
     compile_model(model, schedule)
     model.fit(train_ds, validation_data=val_ds, epochs=FT_EPOCHS,
               callbacks=[early_stop()], verbose=2)
+    p2_sec = time.perf_counter() - t_p2
 
     model.save(os.path.join(OUT_DIR, f"fold{fold}_best.keras"))
 
+    t_tta = time.perf_counter()
     p_mal, p_sub = predict_tta(model, val_idx)
+    tta_sec = time.perf_counter() - t_tta
+
+    print(f"[Fold {fold}] timing -> phase1: {p1_sec:.1f}s | phase2: {p2_sec:.1f}s | TTA: {tta_sec:.1f}s")
+
     out = df.iloc[val_idx][["filepath", "patient_id", "group", "subtype", "tumor_class", "y"]].copy()
     out["fold"] = fold
     out["p_malignant"] = p_mal
@@ -413,157 +444,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
-
-# import os
-# import glob
-# import pandas as pd
-# import numpy as np
-# import tensorflow as tf
-# from sklearn.model_selection import GroupShuffleSplit
-# from sklearn.preprocessing import LabelEncoder
-
-# DATA_DIR = "BreaKHis_v1/histology_slides/breast"  # Adjust to your base directory
-# IMG_HEIGHT, IMG_WIDTH = 224, 224
-# BATCH_SIZE = 32
-
-# file_paths = []
-# labels = []
-# patient_ids = []
-
-# # Walk through all image files inside nested folders
-# for filepath in glob.glob(os.path.join(DATA_DIR, "**/*.png"), recursive=True):
-#     parts = os.path.normpath(filepath).split(os.sep)
-#     # Target label is the subfolder right under SOB (e.g., 'adenosis', 'ductal_carcinoma')
-#     # Parts structure: [..., 'SOB', '<class_name>', '<patient_id>', '<magnification>', '<filename>']
-#     try:
-#         sob_index = parts.index("SOB")
-#         class_label = parts[sob_index + 1]
-#         patient_id = parts[sob_index + 2]
-        
-#         file_paths.append(filepath)
-#         labels.append(class_label)
-#         patient_ids.append(patient_id)
-#     except (ValueError, IndexError):
-#         continue
-
-# df = pd.DataFrame({
-#     'filepath': file_paths,
-#     'label': labels,
-#     'patient_id': patient_ids
-# })
-
-# print(f"Total images found: {len(df)}")
-# print(f"Classes found ({len(df['label'].unique())}): {df['label'].unique()}")
-
-# # Encode categorical labels to integers
-# label_encoder = LabelEncoder()
-# df['label_encoded'] = label_encoder.fit_transform(df['label'])
-# num_classes = len(label_encoder.classes_)
-
-# # ==========================================
-# # 2. PATIENT-LEVEL TRAIN / VALIDATION SPLIT
-# # ==========================================
-# gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-# train_idx, val_idx = next(gss.split(df, groups=df['patient_id']))
-
-# train_df = df.iloc[train_idx].reset_index(drop=True)
-# val_df = df.iloc[val_idx].reset_index(drop=True)
-
-# print(f"Train samples: {len(train_df)} | Val samples: {len(val_df)}")
-
-# # ==========================================
-# # 3. TF.DATA PIPELINE CREATION
-# # ==========================================
-# def parse_image(filepath, label):
-#     image = tf.io.read_file(filepath)
-#     image = tf.image.decode_png(image, channels=3)
-#     image = tf.image.resize(image, [IMG_HEIGHT, IMG_WIDTH])
-#     # EfficientNet handles internal scaling, but standard models use [0, 255] or [-1, 1]
-#     return image, label
-
-# def build_dataset(dataframe, is_training=True):
-#     paths = dataframe['filepath'].values
-#     labels = dataframe['label_encoded'].values
-    
-#     dataset = tf.data.Dataset.from_tensor_slices((paths, labels))
-#     if is_training:
-#         dataset = dataset.shuffle(buffer_size=len(dataframe))
-    
-#     dataset = dataset.map(parse_image, num_parallel_calls=tf.data.AUTOTUNE)
-#     dataset = dataset.batch(BATCH_SIZE)
-#     dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
-#     return dataset
-
-# train_ds = build_dataset(train_df, is_training=True)
-# val_ds = build_dataset(val_df, is_training=False)
-
-# # ==========================================
-# # 4. TRANSFER LEARNING MODEL (EfficientNetB0)
-# # ==========================================
-# data_augmentation = tf.keras.Sequential([
-#     tf.keras.layers.RandomFlip("horizontal_and_vertical"),
-#     tf.keras.layers.RandomRotation(0.2),
-#     tf.keras.layers.RandomZoom(0.1),
-# ])
-
-# base_model = tf.keras.applications.EfficientNetB0(
-#     include_top=False,
-#     weights='imagenet',
-#     input_shape=(IMG_HEIGHT, IMG_WIDTH, 3)
-# )
-# base_model.trainable = False  # Freeze pretrained weights initially
-
-# inputs = tf.keras.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
-# x = data_augmentation(inputs)
-# x = base_model(x, training=False)
-# x = tf.keras.layers.GlobalAveragePooling2D()(x)
-# x = tf.keras.layers.Dropout(0.45)(x)
-# outputs = tf.keras.layers.Dense(num_classes, activation='softmax')(x)
-
-# model = tf.keras.Model(inputs, outputs)
-
-# model.compile(
-#     optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-#     loss=tf.keras.losses.SparseCategoricalCrossentropy(),
-#     metrics=['accuracy']
-# )
-
-# model.summary()
-
-# # ==========================================
-# # 5. TRAIN & FINE-TUNE
-# # ==========================================
-# epochs = 10
-# history = model.fit(
-#     train_ds,
-#     validation_data=val_ds,
-#     epochs=epochs
-# )
-
-# # Optional: Fine-tuning step
-# base_model.trainable = True
-# for layer in base_model.layers[:-40]:
-#     layer.trainable = False
-# for layer in base_model.layers:
-#     if isinstance(layer, tf.keras.layers.BatchNormalization):
-#         layer.trainable = False
-# model.compile(
-#     optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),  # Low LR for fine-tuning
-#     loss=tf.keras.losses.SparseCategoricalCrossentropy(),
-#     metrics=['accuracy']
-# )
-
-# fine_tune_epochs = 5
-# total_epochs = epochs + fine_tune_epochs
-
-# history_fine = model.fit(
-#     train_ds,
-#     validation_data=val_ds,
-#     epochs=total_epochs,
-#     initial_epoch=history.epoch[-1]
-# )
-
-# # Save in modern .keras format
-# model.save("breakhis_classifier.keras")
-# print("Model training complete and saved.")
