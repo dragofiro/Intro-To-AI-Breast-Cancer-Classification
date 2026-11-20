@@ -20,7 +20,8 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
+from sklearn.metrics import roc_auc_score, confusion_matrix
+from evaluation_metrics import threshold_for_sensitivity
 
 # ============================================================
 # CONFIG
@@ -319,17 +320,6 @@ def sens_spec(y, p, thr):
     return sens, spec, (tn, fp, fn, tp)
 
 
-def threshold_for_sensitivity(y, p, target):
-    fpr, tpr, thr = roc_curve(y, p)
-    valid = np.flatnonzero(tpr >= target)
-    if len(valid) == 0:
-        best_idx = int(np.argmax(tpr))
-        print(f"Warning: target sensitivity {target:.2f} unreachable; "
-              f"using max achievable sensitivity {tpr[best_idx]:.3f}.")
-        return float(thr[best_idx])
-    return float(thr[int(valid[-1])])
-
-
 # ============================================================
 # 7. CROSS-VALIDATION LOOP
 # ============================================================
@@ -424,7 +414,7 @@ def main():
 
     # ---- Pooled out-of-fold, sensitivity-targeted ----
     print(f"\nTarget patient-level sensitivity {TARGET_SENSITIVITY:.0%} -> threshold {thr:.4f} "
-          f"(chosen on pooled OOF predictions, so slightly optimistic; check per-fold numbers above)")
+          f"(chosen on pooled OOF predictions; metrics at this threshold are not independent test results)")
     for name, d in (("IMAGE", oof), ("PATIENT", pat)):
         se, sp, (tn, fp, fn, tp) = sens_spec(d["y"].values, d["p_malignant"].values, thr)
         print(f"{name:8s} pooled AUC {safe_auc(d['y'], d['p_malignant']):.3f} | "
