@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Classifier Evaluation Results</title>
+  <style>
+    body { max-width: 48rem; margin: 2rem auto; padding: 0 1rem; font: 1rem/1.5 system-ui; color: #172437; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: .6rem; text-align: left; border-bottom: 1px solid #dbe2ea; }
+    thead { background: #eef2f7; }
+    .lowest { background: #fff3cd; font-weight: 600; }
+    button, input { font: inherit; margin: .5rem 0; max-width: 100%; }
+    #status { font-weight: 600; }
+    .chart { margin: 1.5rem 0; }
+    .chart h2 { margin-bottom: .25rem; }
+    .chart-note { color: #475569; margin-top: 0; }
+    .chart-fold { padding: .65rem .8rem; border-radius: .4rem; }
+    .chart-fold + .chart-fold { margin-top: .4rem; }
+    .chart-metric {
+      display: grid; grid-template-columns: minmax(6rem, 9rem) minmax(0, 1fr) 4rem;
+      align-items: center; gap: .5rem; margin-top: .3rem; font-size: .9rem;
+    }
+    .chart-metric span:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+    .bar-track { height: .75rem; background: #e2e8f0; border-radius: .25rem; }
+    .bar-fill { height: 100%; border-radius: inherit; }
+    .bar-recall { background: #2563eb; }
+    .bar-specificity { background: #0f766e; }
+  </style>
+</head>
+<body>
+  <h1>Classifier Evaluation Results</h1>
+  <p>Malignant recall is the share of malignant patient records correctly flagged.
+    Specificity is the share of benign records correctly left unflagged.</p>
+  <label for="csv">Choose fold_metrics.csv:</label>
+  <input id="csv" type="file" accept=".csv,text/csv">
+  <button id="sample" type="button">Load sample data</button>
+  <p id="status" role="status">No evaluation results loaded.</p>
+
+  <section id="chart" class="chart" aria-labelledby="chart-title" hidden>
+    <h2 id="chart-title">Recall and specificity by fold</h2>
+    <p class="chart-note">Bars run from 0 to 100%. Exact values are in the table below.</p>
+    <div id="chart-rows" aria-hidden="true"></div>
+    <p id="chart-insight"></p>
+  </section>
+  <table id="results" hidden>
+    <caption>Patient-level metrics by fold</caption>
+    <thead>
+      <tr><th scope="col">Fold</th><th scope="col">Malignant recall</th>
+        <th scope="col">Specificity</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <p>The evaluation script selects the cutoff from the same pooled predictions
+    used in this report. These are not independent test results.</p>
+
+  <script>
+    const fileInput = document.querySelector("#csv");
+    const table = document.querySelector("#results");
+    const body = table.querySelector("tbody");
+    const status = document.querySelector("#status");
+    const chart = document.querySelector("#chart");
+    const chartRows = document.querySelector("#chart-rows");
+    const chartInsight = document.querySelector("#chart-insight");
+    let loadId = 0;
+
+    function readRate(value) {
+      if (value === "" || /^nan$/i.test(value)) return null;
+      const rate = Number(value);
+      if (!Number.isFinite(rate) || rate < 0 || rate > 1) {
+        throw new Error("Recall and specificity must be between 0 and 1.");
+      }
+      return rate;
+    }
+
+    function percent(value) {
+      return value === null ? "N/A" : `${(value * 100).toFixed(1)}%`;
+    }
+
+    function clearResults() {
+      body.replaceChildren();
+      chartRows.replaceChildren();
+      chartInsight.textContent = "";
+      table.hidden = true;
+      chart.hidden = true;
+    }
+
+    function showChart(rows, lowest, isSample) {
+      for (const row of rows) {
+        const group = document.createElement("div");
+        group.className = "chart-fold";
+        const isLowest = lowest !== null && row.recall === lowest;
+        if (isLowest) group.classList.add("lowest");
+        const title = document.createElement("strong");
+        title.textContent = `Fold ${row.fold}${isLowest ? " — lowest recall" : ""}`;
+        group.append(title);
+
+        for (const [label, value, color] of [
+          ["Malignant recall", row.recall, "bar-recall"],
+          ["Specificity", row.specificity, "bar-specificity"]
+        ]) {
+          const metric = document.createElement("div");
+          metric.className = "chart-metric";
+          const name = document.createElement("span");
+          name.textContent = label;
+          const track = document.createElement("div");
+          track.className = "bar-track";
+          if (value !== null) {
+            const fill = document.createElement("div");
+            fill.className = `bar-fill ${color}`;
+            fill.style.width = `${value * 100}%`;
+            track.append(fill);
+          }
+          const number = document.createElement("span");
+          number.textContent = percent(value);
+          metric.append(name, track, number);
+          group.append(metric);
+        }
+        chartRows.append(group);
+      }
+
+      const lowestRows = rows.filter(row => lowest !== null && row.recall === lowest);
+      const prefix = isSample ? "In this sample, " : "";
+      if (lowestRows.length === 1) {
+        const row = lowestRows[0];
+        chartInsight.textContent = prefix +
+          `${isSample ? "fold" : "Fold"} ${row.fold} had the lowest malignant recall (${percent(row.recall)})` +
+          (row.specificity === null ? "." : `, with ${percent(row.specificity)} specificity.`);
+      } else if (lowestRows.length > 1) {
+        chartInsight.textContent = prefix +
+          `${lowestRows.length} folds tied for lowest malignant recall (${percent(lowest)}).`;
+      } else {
+        chartInsight.textContent = "Malignant recall was not reported for any fold.";
+      }
+      chart.hidden = false;
+    }
+
+    function showResults(csv, label, isSample = false) {
+      clearResults();
+      try {
+        // fold_metrics.csv contains simple numeric fields and unquoted headers.
+        const [header, ...lines] = csv.replace(/^\uFEFF/, "")
+          .trim().split(/\r?\n/).filter(line => line.trim());
+        const columns = (header || "").split(",").map(value => value.trim());
+        const indexes = ["fold", "pat_sens@thr", "pat_spec@thr"]
+          .map(name => columns.indexOf(name));
+        if (indexes.includes(-1)) {
+          throw new Error("Expected fold, pat_sens@thr, and pat_spec@thr columns.");
+        }
+        const rows = lines.map(line => {
+          const fields = line.split(",").map(value => value.trim());
+          const [fold, recall, specificity] = indexes.map(index => fields[index]);
+          if (fields.length !== columns.length || !/^\d+$/.test(fold)) {
+            throw new Error("Found an invalid fold row.");
+          }
+          return { fold, recall: readRate(recall), specificity: readRate(specificity) };
+        });
+        if (!rows.length) throw new Error("The CSV has no fold results.");
+        const measured = rows.filter(row => row.recall !== null);
+        const lowest = measured.length ? Math.min(...measured.map(row => row.recall)) : null;
+        for (const row of rows) {
+          const tr = body.insertRow();
+          const isLowest = lowest !== null && row.recall === lowest;
+          if (isLowest) tr.classList.add("lowest");
+          tr.insertCell().textContent = row.fold;
+          tr.insertCell().textContent = percent(row.recall) + (isLowest ? " (lowest)" : "");
+          tr.insertCell().textContent = percent(row.specificity);
+        }
+        status.textContent = `${label} — ${rows.length} fold${rows.length === 1 ? "" : "s"} loaded.`;
+        table.hidden = false;
+        showChart(rows, lowest, isSample);
+      } catch (error) {
+        clearResults();
+        status.textContent = `Could not load results: ${error.message}`;
+      }
+    }
+
+    fileInput.addEventListener("change", async () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+      const id = ++loadId;
+      clearResults();
+      status.textContent = "Loading evaluation results…";
+      try {
+        const csv = await file.text();
+        if (id === loadId) showResults(csv, `Loaded: ${file.name}`);
+      } catch {
+        if (id === loadId) status.textContent = "Could not read the selected file.";
+      }
+    });
+
+    document.querySelector("#sample").addEventListener("click", () => {
+      ++loadId;
+      fileInput.value = "";
+      showResults(
+        "fold,pat_sens@thr,pat_spec@thr\n0,0.95,0.82\n1,0.88,0.91\n2,0.97,0.79",
+        "Sample data — not model results", true
+      );
+    });
+  </script>
+</body>
+</html>
