@@ -6,6 +6,7 @@ Outputs (in OUT_DIR):
   fold{k}_best.keras      model for each fold
   oof_predictions.csv     out-of-fold image-level predictions (with TTA)
   patient_predictions.csv out-of-fold patient-level predictions
+  fold_metrics.csv        per-fold image-level and patient-level evaluation metrics
   threshold.json          operating threshold chosen for the target sensitivity
 """
 import os
@@ -408,6 +409,9 @@ def main():
             "subtype_acc": (o["pred_subtype"] == o["subtype_id"]).mean(),
         })
     report = pd.DataFrame(rows).set_index("fold")
+    fold_metrics_path = os.path.join(OUT_DIR, "fold_metrics.csv")
+    report.to_csv(fold_metrics_path)
+    print(f"Saved per-fold metrics: {fold_metrics_path}")
     print(report.round(3).to_string())
     print("\nmean +/- std across folds")
     print(pd.DataFrame({"mean": report.mean(), "std": report.std()}).round(3).to_string())
